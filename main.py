@@ -1,9 +1,13 @@
 import sys
 from pathlib import Path
 from datetime import datetime
+import re
+import requests
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import services as svc
+
+APP_NAME = "MCSHoster"
 
 def info_button(text: str, parent: QtWidgets.QWidget) -> QtWidgets.QToolButton:
     btn = QtWidgets.QToolButton()
@@ -90,17 +94,41 @@ class SetupTab(QtWidgets.QWidget):
 
     def load_versions(self):
         self.version_combo.clear()
+        self.version_combo.addItem("Loading versions...")
+        self.refresh_btn.setEnabled(False)
+        
         try:
             versions = svc.get_versions()
-            releases = [v for v in versions if v["type"] == "release"]
-            snapshots = [v for v in versions if v["type"] == "snapshot"]
+            self.version_combo.clear()
+            
+            if not versions:
+                self.version_combo.addItem("No versions available")
+                self.log("No versions found from Mojang.")
+                return
+            
+            releases = [v for v in versions if v.get("type") == "release"]
+            snapshots = [v for v in versions if v.get("type") == "snapshot"]
+            
             for v in releases[:60]:
                 self.version_combo.addItem(f"{v['id']} (release)", v["id"])
             for v in snapshots[:20]:
                 self.version_combo.addItem(f"{v['id']} (snapshot)", v["id"])
-            self.log("Versions loaded.")
+            
+            self.log(f"Loaded {len(releases)} releases and {len(snapshots)} snapshots.")
+        except requests.exceptions.ConnectionError:
+            self.version_combo.clear()
+            self.version_combo.addItem("Connection error")
+            self.log("Failed to load versions: No internet connection.")
+        except requests.exceptions.Timeout:
+            self.version_combo.clear()
+            self.version_combo.addItem("Timeout")
+            self.log("Failed to load versions: Request timed out.")
         except Exception as e:
+            self.version_combo.clear()
+            self.version_combo.addItem("Error loading versions")
             self.log(f"Failed to load versions: {e}")
+        finally:
+            self.refresh_btn.setEnabled(True)
 
     def download_version(self):
         vid = self.version_combo.currentData()
@@ -120,17 +148,18 @@ class SetupTab(QtWidgets.QWidget):
                 self.log(f"Upload failed: {e}")
 
     def bootstrap_server(self):
+        if not self.eula_checkbox.isChecked():
+            QtWidgets.QMessageBox.warning(self, "EULA Required", "You must check the 'Accept EULA' box before bootstrapping the server.")
+            return
+        # Explicitly set EULA to true before running, to avoid race conditions.
+        svc.set_eula(self.state["server_dir"], True)
+        self.log("EULA set to true. Starting bootstrap...")
         ok, out = svc.bootstrap_server(self.state["server_dir"], self.state.get("java_args"))
         self.log(out.strip() or "(no output)")
         self.log("Bootstrap complete." if ok else "Bootstrap failed or timed out.")
 
     def toggle_eula(self, state):
-        # This is now just for visual feedback. The bootstrap process handles the actual write.
-        is_checked = state == QtCore.Qt.Checked
-        if is_checked:
-            svc.set_eula(self.state["server_dir"], True)
-        svc.set_eula(self.state["server_dir"], state == QtCore.Qt.Checked)
-        self.log("EULA updated.")
+        self.log(f"EULA checkbox {'checked' if state == QtCore.Qt.Checked else 'unchecked'}.")
 
     def log(self, msg: str):
         self.status.appendPlainText(msg)
@@ -268,26 +297,29 @@ class UsersTab(QtWidgets.QWidget):
         refresh_btn = QtWidgets.QPushButton("Refresh lists")
         refresh_btn.clicked.connect(self.refresh_lists)
 
-        grid = QtWidgets.QGridLayout(self)
-        grid.addWidget(QtWidgets.QLabel("Ops"), 0, 0)
-        grid.addWidget(self.ops_list, 1, 0, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("Name"), 2, 0)
-        grid.addWidget(self.op_name, 2, 1)
-        grid.addWidget(QtWidgets.QLabel("UUID (optional)"), 3, 0)
-        grid.addWidget(self.op_uuid, 3, 1)
-        grid.addWidget(self.op_add, 4, 0)
-        grid.addWidget(self.op_remove, 4, 1)
+        ops_box = QtWidgets.QGroupBox("Ops")
+        ops_layout = QtWidgets.QGridLayout()
+        ops_layout.addWidget(self.ops_list, 0, 0, 1, 2)
+        ops_layout.addWidget(QtWidgets.QLabel("Name:"), 1, 0); ops_layout.addWidget(self.op_name, 1, 1)
+        ops_layout.addWidget(QtWidgets.QLabel("UUID (optional):"), 2, 0); ops_layout.addWidget(self.op_uuid, 2, 1)
+        ops_layout.addWidget(self.op_add, 3, 0); ops_layout.addWidget(self.op_remove, 3, 1)
+        ops_box.setLayout(ops_layout)
 
-        grid.addWidget(QtWidgets.QLabel("Whitelist"), 0, 2)
-        grid.addWidget(self.wl_list, 1, 2, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("Name"), 2, 2)
-        grid.addWidget(self.wl_name, 2, 3)
-        grid.addWidget(QtWidgets.QLabel("UUID ( optional )"), 3, 2)
-        grid.addWidget(self.wl_uuid, 3, 3)
-        grid.addWidget(self.wl_add, 4, 2)
-        grid.addWidget(self.wl_remove, 4, 3)
+        wl_box = QtWidgets.QGroupBox("Whitelist")
+        wl_layout = QtWidgets.QGridLayout()
+        wl_layout.addWidget(self.wl_list, 0, 0, 1, 2)
+        wl_layout.addWidget(QtWidgets.QLabel("Name:"), 1, 0); wl_layout.addWidget(self.wl_name, 1, 1)
+        wl_layout.addWidget(QtWidgets.QLabel("UUID (optional):"), 2, 0); wl_layout.addWidget(self.wl_uuid, 2, 1)
+        wl_layout.addWidget(self.wl_add, 3, 0); wl_layout.addWidget(self.wl_remove, 3, 1)
+        wl_box.setLayout(wl_layout)
 
-        grid.addWidget(refresh_btn, 5, 0, 1, 4)
+        main_layout = QtWidgets.QVBoxLayout(self)
+        h_layout = QtWidgets.QHBoxLayout()
+        h_layout.addWidget(ops_box)
+        h_layout.addWidget(wl_box)
+        main_layout.addLayout(h_layout)
+        main_layout.addWidget(refresh_btn)
+
         self.refresh_lists()
 
     def refresh_lists(self):
@@ -343,6 +375,7 @@ class PluginsTab(QtWidgets.QWidget):
         super().__init__()
         self.state = state
         self.list = QtWidgets.QListWidget()
+        self.refresh_btn = QtWidgets.QPushButton("Refresh")
         self.upload_btn = QtWidgets.QPushButton("Upload plugin jar")
         self.remove_btn = QtWidgets.QPushButton("Remove selected")
         self.disable_btn = QtWidgets.QPushButton("Disable selected")
@@ -352,10 +385,12 @@ class PluginsTab(QtWidgets.QWidget):
         self.remove_btn.clicked.connect(self.remove_plugin)
         self.disable_btn.clicked.connect(self.disable_plugin)
         self.enable_btn.clicked.connect(self.enable_plugin)
+        self.refresh_btn.clicked.connect(self.refresh)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.list)
         hl = QtWidgets.QHBoxLayout()
+        hl.addWidget(self.refresh_btn)
         hl.addWidget(self.upload_btn)
         hl.addWidget(self.remove_btn)
         hl.addWidget(self.disable_btn)
@@ -454,6 +489,10 @@ class HostToolsTab(QtWidgets.QWidget):
         layout.addWidget(fw_box)
         self.refresh_backups()
 
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.check_schedule)
+        self.timer.start(60 * 1000)
+
     def open_fw(self):
         try:
             svc.open_firewall_port(25565, "Minecraft")
@@ -471,10 +510,6 @@ class HostToolsTab(QtWidgets.QWidget):
         except Exception as e:
             msg = f"Failed to remove firewall rule. Please try running this application as an Administrator.\n\nDetails: {e}"
             QtWidgets.QMessageBox.critical(self, "Firewall Error", msg)
-
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self.check_schedule)
-        self.timer.start(60 * 1000)
 
     def row_with(self, *widgets):
         h = QtWidgets.QHBoxLayout()
@@ -518,21 +553,24 @@ class HostToolsTab(QtWidgets.QWidget):
             svc.log(self.state["server_dir"], f"Restore failed: {e}")
 
     def update_next_runs(self):
+        from datetime import timedelta
         now = datetime.now()
         nexts = []
 
         def get_next_run(hr: int) -> datetime:
             nxt = now.replace(hour=hr, minute=0, second=0, microsecond=0)
             if nxt <= now:
-                nxt += QtCore.QTime(0,0).secsTo(QtCore.QTime(24,0)) # no-op
+                nxt += timedelta(days=1)  # Fixed: properly add 1 day
             return nxt
 
         if self.enable_restart.isChecked():
             hr = self.restart_hour.value()
-            nexts.append(f"restart at {get_next_run(hr).strftime('%H:%M')}")
+            next_time = get_next_run(hr)
+            nexts.append(f"restart at {next_time.strftime('%Y-%m-%d %H:%M')}")
         if self.enable_backup.isChecked():
             hr = self.backup_hour.value()
-            nexts.append(f"backup at {get_next_run(hr).strftime('%H:%M')}")
+            next_time = get_next_run(hr)
+            nexts.append(f"backup at {next_time.strftime('%Y-%m-%d %H:%M')}")
         self.next_runs_label.setText(", ".join(nexts) if nexts else "—")
 
     def check_schedule(self):
@@ -588,34 +626,63 @@ class ConsoleTab(QtWidgets.QWidget):
         if not self.proc:
             QtWidgets.QMessageBox.warning(self, "Error", "Server process not initialized. Check App Settings.")
             return
+        
+        # Check if server.jar exists
+        jar_path = self.state["server_dir"] / svc.SERVER_JAR_NAME
+        if not jar_path.exists():
+            QtWidgets.QMessageBox.warning(
+                self, "Error", 
+                f"server.jar not found at:\n{jar_path}\n\nGo to Setup tab to download or upload a server jar."
+            )
+            return
 
         try:
+            self.console.clear()
+            self.console.appendPlainText("[MCSHoster] Starting server...")
             self.proc.start()
+        except FileNotFoundError as e:
+            QtWidgets.QMessageBox.critical(self, APP_NAME, f"Java not found. Please install Java and ensure it's in your PATH.\n\nError: {e}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, APP_NAME, f"Failed to start: {e}")
 
     def stop_server(self):
-        self.proc.stop()
         if not self.proc:
+            QtWidgets.QMessageBox.warning(self, "Error", "No server process to stop.")
             return
-        self.proc.stop()
+        try:
+            self.proc.stop()
+            self.console.appendPlainText("[MCSHoster] Stop command sent to server...")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to stop server: {e}")
 
     def send_cmd(self):
         cmd = self.cmd_input.text().strip()
-        if cmd:
+        if not cmd:
+            return
+        if not self.proc:
+            QtWidgets.QMessageBox.warning(self, "Error", "Server not initialized.")
+            return
+        try:
             self.proc.send_command(cmd)
+            self.console.appendPlainText(f"> {cmd}")
             self.cmd_input.clear()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Error", f"Failed to send command: {e}")
 
     def open_external(self):
         try:
             jar = self.state["server_dir"] / svc.SERVER_JAR_NAME
+            if not jar.exists():
+                QtWidgets.QMessageBox.warning(self, "Error", "server.jar not found. Go to Setup tab first.")
+                return
             args = self.state.get("java_args") or ["-Xms1G", "-Xmx1G"]
-            cmd_line = " ".join(["java"] + args + ["-jar", str(jar), "nogui"])
-            subprocess = QtCore.QProcess(self)
-            subprocess.setWorkingDirectory(str(self.state["server_dir"]))
-            subprocess.start("cmd.exe", ["/k", cmd_line])
+            cmd_line = " ".join(["java"] + args + ["-jar", f'"{jar}"', "nogui"])
+            external_process = QtCore.QProcess(self)
+            external_process.setWorkingDirectory(str(self.state["server_dir"]))
+            external_process.start("cmd.exe", ["/k", cmd_line])
+            self.console.appendPlainText("[MCSHoster] Opened server in external CMD window.")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, APP_NAME, str(e))
+            QtWidgets.QMessageBox.critical(self, APP_NAME, f"Failed to open external console: {e}")
 
     def toggle_timestamps(self, state):
         self.state["console_timestamps"] = state == QtCore.Qt.Checked
@@ -632,13 +699,18 @@ class AppSettingsTab(QtWidgets.QWidget):
         self.xms_spin = QtWidgets.QSpinBox(); self.xms_spin.setRange(256, 16384); self.xms_spin.setSuffix(" MB")
         self.xmx_spin = QtWidgets.QSpinBox(); self.xmx_spin.setRange(512, 32768); self.xmx_spin.setSuffix(" MB")
         ja = self.state.get("java_args") or ["-Xms1G", "-Xmx1G"]
-        def parse_mb(flag):
-            return int(flag[4:-1]) * 1024 if flag.endswith("G") else int(flag[4:-2])
+
+        def parse_mem_arg(arg_str, default_mb):
+            match = re.match(r"-Xm[sx](\d+)([GgMm])", arg_str)
+            if not match: return default_mb
+            val, unit = int(match.group(1)), match.group(2).upper()
+            return val * 1024 if unit == 'G' else val
+
         try:
-            self.xms_spin.setValue(1024 if "G" in ja[0] else int(ja[0][4:-2]))
-            self.xmx_spin.setValue(2048 if "G" in ja[1] else int(ja[1][4:-2]))
+            self.xms_spin.setValue(parse_mem_arg(ja[0], 1024))
+            self.xmx_spin.setValue(parse_mem_arg(ja[1], 2048))
         except:
-            self.xms_spin.setValue(1024); self.xmx_spin.setValue(2048)
+            self.xms_spin.setValue(1024); self.xmx_spin.setValue(2048) # Fallback
 
         self.apply_btn = QtWidgets.QPushButton("Apply")
         self.apply_btn.clicked.connect(self.on_apply)
@@ -659,17 +731,33 @@ class AppSettingsTab(QtWidgets.QWidget):
         return w
 
     def on_apply(self):
-        self.state["ui_scale"] = self.scale_spin.value()
         xms = self.xms_spin.value()
         xmx = self.xmx_spin.value()
+        
+        # Validate memory settings
+        if xms > xmx:
+            QtWidgets.QMessageBox.warning(
+                self, "Invalid Settings", 
+                "Minimum RAM cannot be greater than Maximum RAM.\n\nPlease adjust the values."
+            )
+            return
+        
+        if xmx < 512:
+            QtWidgets.QMessageBox.warning(
+                self, "Invalid Settings",
+                "Maximum RAM should be at least 512 MB for a Minecraft server."
+            )
+            return
+        
+        self.state["ui_scale"] = self.scale_spin.value()
         self.state["java_args"] = [f"-Xms{xms}M", f"-Xmx{xmx}M"]
         self.apply_settings()
-        QtWidgets.QMessageBox.information(self, "MCSHoster", "Settings applied. Some changes may require an app restart.")
+        QtWidgets.QMessageBox.information(self, APP_NAME, "Settings applied successfully!\n\nNote: Memory changes will apply on next server start.")
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MCSHoster")
+        self.setWindowTitle(APP_NAME)
         self.resize(1200, 800)
 
         self.config_path = Path(__file__).parent / "config.json"
@@ -716,7 +804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         widget = self.centralWidget().widget(index)
         if widget == self.settings_tab:
             self.settings_tab.load_props()
-        elif widget == self.users_tab or widget == self.plugins_tab:
+        elif widget == self.users_tab:
             self.users_tab.refresh_lists()
         elif widget == self.host_tools_tab:
             self.host_tools_tab.refresh_backups()
@@ -747,5 +835,4 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-    APP_NAME = "MCSHoster"
     main()

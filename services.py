@@ -96,7 +96,10 @@ def write_properties(path: Path, props: Dict[str, str]):
 def read_json(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(read_text(path))
+    try:
+        return json.loads(read_text(path))
+    except json.JSONDecodeError:
+        return default
 
 def write_json(path: Path, data):
     backup = path.with_suffix(".bak")
@@ -156,6 +159,8 @@ def bootstrap_server(server_dir: Path, java_args: Optional[List[str]] = None) ->
     return generated, "".join(output_lines)
 
 class ServerProcess:
+    """Manages a Minecraft server process with proper lifecycle handling."""
+    
     def __init__(self, server_dir: Path, java_args: Optional[List[str]] = None, timestamps: bool = False):
         self.server_dir = server_dir
         self.java_args = java_args or ["-Xms1G", "-Xmx1G"]
@@ -164,52 +169,132 @@ class ServerProcess:
         self.on_output = None  # callable(str)
         self.on_state = None   # callable(str)
         self.timestamps = timestamps
+        self._stopping = False
+
+    @property
+    def is_running(self) -> bool:
+        """Check if the server process is currently running."""
+        return self.proc is not None and self.proc.poll() is None
 
     def start(self):
-        if self.proc and self.proc.poll() is None:
+        """Start the Minecraft server process."""
+        if self.is_running:
+            log(self.server_dir, "Server is already running")
             return
+        
+        self._stopping = False
         jar = self.server_dir / SERVER_JAR_NAME
         if not jar.exists():
-            raise FileNotFoundError("server.jar not found")
+            raise FileNotFoundError(f"server.jar not found at {jar}")
+        
         cmd = ["java"] + self.java_args + ["-jar", str(jar), "nogui"]
         try:
-            self.proc = subprocess.Popen(cmd, cwd=str(self.server_dir),
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         stdin=subprocess.PIPE, text=True, bufsize=1,
-                                         encoding='utf-8', errors='replace')
-            if self.on_state: self.on_state("running")
+            self.proc = subprocess.Popen(
+                cmd, 
+                cwd=str(self.server_dir),
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE, 
+                text=True, 
+                bufsize=1,
+                encoding='utf-8', 
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            if self.on_state: 
+                self.on_state("running")
             self._reader_thread = threading.Thread(target=self._reader, daemon=True)
             self._reader_thread.start()
             log(self.server_dir, f"Server started with cmd: {' '.join(cmd)}")
+        except FileNotFoundError:
+            log(self.server_dir, "Java not found. Please install Java.")
+            raise FileNotFoundError("Java executable not found. Please install Java and ensure it's in your PATH.")
         except Exception as e:
             log(self.server_dir, f"Failed to start server: {e}")
             raise
 
     def _reader(self):
+        """Background thread that reads server output."""
         try:
-            for line in self.proc.stdout:
+            while self.proc and not self._stopping:
+                line = self.proc.stdout.readline()
+                if not line:
+                    if self.proc.poll() is not None:
+                        break
+                    continue
                 msg = line.rstrip()
                 if self.timestamps:
                     ts = datetime.now().strftime("%H:%M:%S")
                     msg = f"[{ts}] {msg}"
-                if self.on_output: self.on_output(msg)
+                if self.on_output:
+                    self.on_output(msg)
         except Exception as e:
             log(self.server_dir, f"Reader thread error: {e}")
         finally:
-            if self.on_state: self.on_state("stopped")
+            if self.on_state:
+                self.on_state("stopped")
             log(self.server_dir, "Server process stopped")
+            self._cleanup()
+
+    def _cleanup(self):
+        """Clean up process resources."""
+        try:
+            if self.proc:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+                if self.proc.stdout:
+                    self.proc.stdout.close()
+                self.proc = None
+        except Exception as e:
+            log(self.server_dir, f"Cleanup error: {e}")
 
     def send_command(self, cmd: str):
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.stdin.write(cmd + "\n")
-                self.proc.stdin.flush()
-                log(self.server_dir, f"Sent command: {cmd}")
-            except Exception as e:
-                log(self.server_dir, f"Failed to send command '{cmd}': {e}")
+        """Send a command to the running server."""
+        if not self.is_running:
+            log(self.server_dir, f"Cannot send command '{cmd}': server not running")
+            return False
+        try:
+            self.proc.stdin.write(cmd + "\n")
+            self.proc.stdin.flush()
+            log(self.server_dir, f"Sent command: {cmd}")
+            return True
+        except Exception as e:
+            log(self.server_dir, f"Failed to send command '{cmd}': {e}")
+            return False
 
-    def stop(self):
+    def stop(self, timeout: int = 30):
+        """Gracefully stop the server with timeout."""
+        if not self.is_running:
+            log(self.server_dir, "Server is not running")
+            return
+        
+        self._stopping = True
+        log(self.server_dir, "Sending stop command...")
         self.send_command("stop")
+        
+        # Wait for graceful shutdown
+        try:
+            if self.proc:
+                self.proc.wait(timeout=timeout)
+                log(self.server_dir, "Server stopped gracefully")
+        except subprocess.TimeoutExpired:
+            log(self.server_dir, f"Server did not stop within {timeout}s, force killing...")
+            self.kill()
+        except Exception as e:
+            log(self.server_dir, f"Error during stop: {e}")
+            self.kill()
+
+    def kill(self):
+        """Force kill the server process."""
+        if self.proc:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+                log(self.server_dir, "Server force killed")
+            except Exception as e:
+                log(self.server_dir, f"Error killing process: {e}")
+            finally:
+                self._cleanup()
 
 # Plugin helpers (Bukkit/Spigot/Paper/Purpur style)
 def list_plugins(server_dir: Path) -> List[Path]:
